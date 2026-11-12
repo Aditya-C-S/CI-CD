@@ -1,0 +1,33 @@
+# Excluded folders
+log-test/
+Voice_based-_Tic-Tac-Toe/
+
+# Python caches & build artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+
+# Virtual environments & local wheels
+.venv/
+venv/
+env/
+ENV/
+.tmp_wheels/
+
+# Environment variables & secrets
+.env
+.env.*
+!.env.example
+
+# IDE & OS files
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
