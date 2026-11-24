@@ -87,24 +87,39 @@ class ORCHandler:
         Resolve the appropriate repository path for the given repo_id.
         
         Priority:
-        1. If self.repo_path directory name matches repo_id, use self.repo_path.
-        2. Check if a cache directory exists in Metadata-Pipeline-main/.repo_cache for this repo_id.
-        3. Fall back to self.repo_path if it exists.
+        1. Check local repositories in Capstone directory (e.g. Capstone/<repo_name> or flask clone).
+        2. If self.repo_path directory name matches repo_id, use self.repo_path.
+        3. Check if a cache directory exists in Metadata-Pipeline-main/.repo_cache for this repo_id.
+        4. Fall back to self.repo_path if it exists.
         """
         if not repo_id:
             return self.repo_path
         
         safe_repo_id = repo_id.strip().replace("/", "__")
         repo_name = repo_id.strip().split("/")[-1]
+        dashboard_root = Path(__file__).resolve().parent.parent.parent
 
-        # Check if configured repo_path matches repo_id
+        # 1. Check local clones in Capstone root (e.g. Capstone/flask)
+        try:
+            capstone_root = dashboard_root.parents[2]
+            candidate_clone = capstone_root / repo_name
+            if candidate_clone.exists() and (candidate_clone / ".git").exists():
+                return candidate_clone
+        except Exception:
+            pass
+
+        # Explicit check for known Capstone flask clone
+        flask_local = Path(r"C:\Users\Aditya CS\OneDrive\Documents\Capstone\flask")
+        if repo_name.lower() == "flask" and flask_local.exists() and (flask_local / ".git").exists():
+            return flask_local
+
+        # 2. Check if configured repo_path matches repo_id
         if self.repo_path and self.repo_path.exists():
             curr_name = self.repo_path.name
             if curr_name.lower() in [safe_repo_id.lower(), repo_name.lower()]:
                 return self.repo_path
 
-        # Check Metadata-Pipeline .repo_cache
-        dashboard_root = Path(__file__).resolve().parent.parent.parent
+        # 3. Check Metadata-Pipeline .repo_cache
         repo_cache_dir = dashboard_root.parent / "Metadata-Pipeline-main" / ".repo_cache" / safe_repo_id
         if repo_cache_dir.exists() and (repo_cache_dir / ".git").exists():
             return repo_cache_dir
@@ -245,6 +260,8 @@ class ORCHandler:
             "processing_time_ms": orc_result.get("processing_time_ms", 0),
             "target_sha": orc_result.get("target_sha", ""),
             "timestamp": orc_result.get("timestamp", ""),
+            "commit_source": orc_result.get("commit_source", "Unknown"),
+            "is_local_commit": orc_result.get("is_local_commit", False),
             "orc_raw_result": orc_result,
         }
 

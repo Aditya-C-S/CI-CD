@@ -48,6 +48,10 @@ class CommitPredictionResult:
     # Prediction features (for debugging)
     features: Optional[Dict] = None
     
+    # Commit provenance
+    commit_source: str = "Unknown"
+    is_local_commit: bool = False
+    
     def to_dict(self) -> Dict:
         """Convert to dictionary, handling nested dataclasses."""
         result = asdict(self)

@@ -10,7 +10,7 @@ sys.path.insert(0, str(METADATA_PIPELINE_ROOT))
 
 from Inference_Engine.predictor_service import PredictorService, create_feature_dataframe
 from Metadata_Extractor.core.git_engine import (
-    sync_repo_cache, get_churn_metrics, get_repo_git_metrics
+    sync_repo_cache, get_churn_metrics, get_repo_git_metrics, check_commit_provenance
 )
 from Metadata_Extractor.core.static_analyzer import analyze_workspace
 from Metadata_Extractor.core.github_api import get_github_metadata
@@ -78,6 +78,9 @@ class MetadataAdapter:
                     f"failure_probability out of range [0.0, 1.0]: {failure_prob}"
                 )
             
+            # Check commit provenance (local unpushed vs remote pushed)
+            is_local, commit_source = check_commit_provenance(repo_path, target_sha)
+            
             # Augment with metadata
             prediction_result.update({
                 "owner": owner,
@@ -87,6 +90,8 @@ class MetadataAdapter:
                 "cache_status": cache_status,
                 "features": features_dict,
                 "repo_path": str(repo_path),
+                "is_local_commit": is_local,
+                "commit_source": commit_source,
             })
             return prediction_result
         

@@ -6,6 +6,7 @@ import shutil
 import stat
 from datetime import datetime
 from pathlib import Path
+from typing import Tuple, Union, Optional
 
 SRC_EXTS = {'.py', '.java', '.rb', '.c', '.cpp', '.js', '.ts', '.go', '.rs'}
 DOC_EXTS = {'.md', '.rst', '.txt', '.pdf', '.docx', '.html'}
@@ -170,97 +171,114 @@ def sync_repo_cache(owner: str, repo: str, commit_sha: str = None, token: str = 
         if cache_dir.exists():
             shutil.rmtree(cache_dir, onerror=_handle_remove_readonly)
         
-        try:
-            subprocess.run(
-                f'git clone --quiet "{repo_url}" "{cache_dir}"',
-                shell=True, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            )
-        except subprocess.CalledProcessError as e:
-            raise RuntimeError(f"Failed to clone {owner}/{repo}: {e}")
+        # If source_repo_path is provided and is a valid local git repo, clone locally to avoid internet overhead
+        cloned_locally = False
+        if source_repo_path and os.path.isdir(source_repo_path) and os.path.exists(os.path.join(source_repo_path, ".git")):
+            try:
+                subprocess.run(
+                    f'git clone --quiet "{source_repo_path}" "{cache_dir}"',
+                    shell=True, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                )
+                # Ensure remote origin points to the authentic GitHub repo URL
+                subprocess.run(
+                    f'git remote set-url origin "{repo_url}"',
+                    cwd=cache_dir, shell=True, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                )
+                cloned_locally = True
+                print(f"[EXTRACT] Initial clone populated quickly from local repository {source_repo_path}")
+            except Exception as e:
+                print(f"[EXTRACT] WARNING: Local clone from {source_repo_path} failed: {e}, falling back to remote clone...")
+
+        if not cloned_locally:
+            try:
+                subprocess.run(
+                    f'git clone --quiet "{repo_url}" "{cache_dir}"',
+                    shell=True, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                )
+            except subprocess.CalledProcessError as e:
+                raise RuntimeError(f"Failed to clone {owner}/{repo}: {e}")
         
         cache_status = "miss"
     else:
         # Path B: Cache Hit (Subsequent Runs / Commits)
-        print(f"[EXTRACT] Cache hit – Fetching latest delta for {owner}/{repo}...")
         cache_status = "hit"
         
-        # Fetch from remote
-        fetch_success, _ = _run_git_checked(
-            'git fetch --quiet --all --prune',
-            cache_dir,
-            "fetch from remote"
-        )
+        # Check if the requested commit is ALREADY present in the persistent cache
+        commit_in_cache = False
+        if commit_sha:
+            commit_in_cache, _ = _run_git_checked(
+                f'git rev-parse --verify "{commit_sha}^{{commit}}"',
+                cache_dir,
+                "check commit in cache"
+            )
         
-        if not fetch_success:
-            print(f"[EXTRACT] WARNING: Fetch from remote failed, will attempt recovery...")
-            recovery_attempted = True
+        if commit_in_cache:
+            # Commit is already in cache! Instant checkout without remote fetch overhead
+            print(f"[EXTRACT] Cache hit – commit {commit_sha[:7]} found in local cache, skipping remote fetch.")
+        else:
+            # Commit is not in cache yet.
+            # Check if source_repo_path is provided and has the commit locally
+            source_has_commit = False
+            if commit_sha and source_repo_path and os.path.isdir(source_repo_path):
+                source_has_commit, _ = _run_git_checked(
+                    f'git rev-parse --verify "{commit_sha}^{{commit}}"',
+                    source_repo_path,
+                    "check commit in source repo"
+                )
+            
+            if source_has_commit:
+                # Fast local fetch: fetch directly from local source repository into cache (takes <1s)
+                print(f"[EXTRACT] Local commit detected – fetching {commit_sha[:7]} from {source_repo_path}...")
+                fetch_local_ok, _ = _run_git_checked(
+                    f'git fetch --quiet "{source_repo_path}" "{commit_sha}"',
+                    cache_dir,
+                    "fetch local commit into cache"
+                )
+                if not fetch_local_ok:
+                    print(f"[EXTRACT] WARNING: Failed to fetch commit locally from source repo, falling back to remote fetch...")
+                    _run_git_checked('git fetch --quiet --all --prune', cache_dir, "fetch from remote")
+            else:
+                # Commit is not available locally; fetch delta from remote
+                print(f"[EXTRACT] Cache hit – Fetching latest delta for {owner}/{repo} from remote...")
+                fetch_success, _ = _run_git_checked(
+                    'git fetch --quiet --all --prune',
+                    cache_dir,
+                    "fetch from remote"
+                )
+                if not fetch_success:
+                    print(f"[EXTRACT] WARNING: Fetch from remote failed...")
     
     # Now attempt to checkout the requested commit if specified
     if commit_sha:
         checkout_success = _checkout_commit(cache_dir, commit_sha)
         
         if not checkout_success:
-            # Checkout failed - first check if it's because the commit doesn't exist
-            # Try to determine if this is a transient error or a missing commit
-            
-            # If we haven't attempted recovery yet, try one recovery:
-            # wipe cache and do a fresh clone
-            if not recovery_attempted and cache_status == "hit":
-                print(f"[EXTRACT] WARNING: Checkout of {commit_sha} failed on cache hit, "
-                      f"attempting one recovery: wiping cache and fresh clone...")
-                
-                try:
-                    shutil.rmtree(cache_dir, onerror=_handle_remove_readonly)
-                except Exception as e:
-                    print(f"[EXTRACT] WARNING: Failed to wipe cache: {e}")
-                
-                # Fresh clone
-                try:
-                    subprocess.run(
-                        f'git clone --quiet "{repo_url}" "{cache_dir}"',
-                        shell=True, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            # Checkout failed - check if source repo has it as a fallback
+            if source_repo_path and os.path.isdir(source_repo_path):
+                source_success, _ = _run_git_checked(
+                    f'git rev-parse --verify "{commit_sha}^{{commit}}"',
+                    source_repo_path,
+                    f"check if {commit_sha} exists in source"
+                )
+                if source_success:
+                    fetch_ok, _ = _run_git_checked(
+                        f'git fetch --quiet "{source_repo_path}" "{commit_sha}"',
+                        cache_dir,
+                        "fetch from source"
                     )
-                    cache_status = "miss"
-                except subprocess.CalledProcessError as e:
-                    raise RuntimeError(f"Recovery: fresh clone of {owner}/{repo} failed: {e}")
-                
-                # Try checkout again
-                checkout_success = _checkout_commit(cache_dir, commit_sha)
+                    if fetch_ok:
+                        checkout_success = _checkout_commit(cache_dir, commit_sha)
             
-            # If still not successful, check if the commit is available in the source repo
             if not checkout_success:
-                if source_repo_path and os.path.isdir(source_repo_path):
-                    # Source repo is available - check if commit is there
-                    source_success, _ = _run_git_checked(
-                        f'git rev-parse {commit_sha}',
-                        source_repo_path,
-                        f"check if {commit_sha} exists in source"
-                    )
-                    if source_success:
-                        # Commit exists in source repo but not in cache/remote
-                        # Use the source repository directly for local-only commits
-                        print(f"[EXTRACT] Local-only commit detected: {commit_sha} exists in source repo")
-                        print(f"[EXTRACT] Using source repository directly: {source_repo_path}")
-                        
-                        # Verify the commit is actually checked out in source repo
-                        # (or at least resolvable)
-                        src_verify, _ = _run_git_checked(
-                            f'git rev-parse {commit_sha}',
-                            source_repo_path,
-                            f"verify {commit_sha} in source"
-                        )
-                        if src_verify:
-                            # Successfully use source repo for feature extraction
-                            elapsed = time.time() - start_time
-                            print(f"[EXTRACT] Git sync completed in {elapsed:.2f}s (source repo for local commit)")
-                            return source_repo_path, "source"
-                
-                # Commit doesn't exist anywhere we can reach
                 raise RuntimeError(
                     f"Cannot resolve commit {commit_sha} in {owner}/{repo}. "
-                    f"The commit was not found in remote {repo_url} or local cache. "
-                    f"Verify the commit SHA is correct and has been pushed to GitHub."
+                    f"The commit was not found in local cache, source repo ({source_repo_path}), or remote ({repo_url}). "
+                    f"Verify the commit SHA is correct."
                 )
+        
+        elapsed = time.time() - start_time
+        print(f"[EXTRACT] Git sync completed in {elapsed:.2f}s (commit {commit_sha[:7]} verified)")
+        return cache_dir, cache_status
     else:
         # No specific commit requested - checkout remote default branch HEAD
         default_branch_output = subprocess.run(
@@ -444,3 +462,37 @@ def get_repo_git_metrics(repo_path: str, commit_sha: str) -> dict:
         metrics["gh_first_commit_created_at_month"] = 1
         metrics["gh_repo_age"] = 0
     return metrics
+
+
+def check_commit_provenance(repo_path: Union[str, Path], commit_sha: str) -> Tuple[bool, str]:
+    """
+    Check if a commit exists on a remote-tracking branch.
+    
+    Args:
+        repo_path: Repository or cache path
+        commit_sha: Commit SHA to inspect
+        
+    Returns:
+        (is_local_commit, commit_source_string)
+        e.g. (False, "Remote (origin/main)") or (True, "Local Unpushed Commit")
+    """
+    if not commit_sha:
+        return False, "Remote (HEAD)"
+    try:
+        res = subprocess.run(
+            f'git branch -r --contains "{commit_sha}"',
+            cwd=str(repo_path),
+            capture_output=True,
+            text=True,
+            shell=True,
+        )
+        if res.returncode == 0 and res.stdout.strip():
+            lines = [l.strip() for l in res.stdout.strip().splitlines() if l.strip()]
+            origin_branches = [b for b in lines if "origin/" in b]
+            if origin_branches:
+                return False, f"Remote ({origin_branches[0]})"
+            return False, f"Remote ({lines[0]})"
+    except Exception:
+        pass
+    return True, "Local Unpushed Commit"
+

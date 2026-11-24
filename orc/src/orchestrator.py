@@ -254,6 +254,8 @@ class Orchestrator:
                 suspicious_files=suspicious_files,
                 processing_time_ms=elapsed_ms,
                 features=prediction_result.get("features"),
+                commit_source=prediction_result.get("commit_source", "Unknown"),
+                is_local_commit=prediction_result.get("is_local_commit", False),
             )
             
             # Mark final checkpoint as COMPLETE only after everything succeeds
@@ -554,4 +556,6 @@ class Orchestrator:
             suspicious_files=suspicious_files,
             processing_time_ms=proc_time,
             features=pred.get("features"),
+            commit_source=pred.get("commit_source", "Unknown"),
+            is_local_commit=pred.get("is_local_commit", False),
         )

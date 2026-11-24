@@ -74,6 +74,10 @@ class CommitAnalysisResponse(BaseModel):
     
     # Features (for debugging / model transparency)
     features: Optional[Dict[str, Any]] = None
+    
+    # Commit provenance
+    commit_source: Optional[str] = None
+    is_local_commit: Optional[bool] = None
 
 
 # ---------------------------------------------------------------------------
@@ -91,22 +95,43 @@ def _get_orchestrator():
         return _orchestrator
     
     try:
-        # Add ORC to path
-        orc_path = Path(__file__).resolve().parent.parent.parent.parent / "orc" / "src"
-        if str(orc_path) not in sys.path:
-            sys.path.insert(0, str(orc_path))
-        
-        # Import ORC components
-        from orchestrator import Orchestrator
-        from models import CommitPredictionResult
-        
-        # Initialize with environment config
         import os
+        import types
+        from dotenv import load_dotenv
+
+        # Resolve project roots
+        base_dir = Path(__file__).resolve().parent.parent.parent.parent
+        orc_src = base_dir / "orc" / "src"
+        meta_pipeline = base_dir / "Metadata-Pipeline-main"
+        graph_gen = base_dir / "graph-doc-gen-main"
+        
+        # Inject sibling repositories into sys.path
+        if str(meta_pipeline) not in sys.path and meta_pipeline.exists():
+            sys.path.insert(0, str(meta_pipeline))
+        if str(graph_gen) not in sys.path and graph_gen.exists():
+            sys.path.insert(0, str(graph_gen))
+        
+        # Register orc_core as a package in sys.modules so intra-package relative imports resolve
+        if "orc_core" not in sys.modules:
+            pkg = types.ModuleType("orc_core")
+            pkg.__path__ = [str(orc_src)]
+            pkg.__file__ = str(orc_src / "__init__.py")
+            pkg.__package__ = "orc_core"
+            sys.modules["orc_core"] = pkg
+        
+        from orc_core.orchestrator import Orchestrator
+        from orc_core.models import CommitPredictionResult
+        
+        # Load environment variables from orc/.env if available
+        orc_env = base_dir / "orc" / ".env"
+        if orc_env.exists():
+            load_dotenv(orc_env)
+        
         github_token = os.getenv("GITHUB_TOKEN", "")
         if not github_token:
             logger.warning("GITHUB_TOKEN not set; ORC will have limited functionality")
         
-        investigation_threshold = float(os.getenv("ORC_INVESTIGATION_THRESHOLD", "0.50"))
+        investigation_threshold = float(os.getenv("INVESTIGATION_THRESHOLD", os.getenv("ORC_INVESTIGATION_THRESHOLD", "0.50")))
         
         _orchestrator = Orchestrator(
             github_token=github_token,
@@ -204,6 +229,8 @@ def analyze_commit(req: AnalyzeCommitRequest) -> Dict[str, Any]:
             "timestamp": result_dict["timestamp"],
             "processing_time_ms": result_dict["processing_time_ms"],
             "features": result_dict.get("features"),
+            "commit_source": result_dict.get("commit_source", "Unknown"),
+            "is_local_commit": result_dict.get("is_local_commit", False),
         }
         
         logger.info(
