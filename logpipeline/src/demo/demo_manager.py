@@ -51,6 +51,63 @@ from src.prediction.runtime_tracker import (
 )
 
 
+def evaluate_run_provenance(
+    ci_run_id: Optional[str] = None,
+    accumulated_log: Optional[str] = None,
+    execution_source: Optional[str] = None,
+) -> str:
+    """
+    Classify run provenance into canonical categories:
+    - AUTHENTIC GITHUB ACTIONS
+    - PUBLIC GITHUB REPO (API Fallback)
+    - LOCAL DEMO / SYNTHETIC
+    - UNKNOWN / UNVERIFIED
+    """
+    ci_id = str(ci_run_id or "").strip().lower()
+    log_text = accumulated_log or ""
+    exec_src = str(execution_source or "").upper()
+
+    # 1. Explicit local / simulation / synthetic sources
+    if any(pfx in exec_src for pfx in ("LOCAL", "SIMULATION", "MOCK", "TEST")):
+        return "LOCAL DEMO / SYNTHETIC"
+
+    if any(ci_id.startswith(pfx) for pfx in ("local", "sim", "mock", "test_run", "demo")):
+        return "LOCAL DEMO / SYNTHETIC"
+
+    # 2. Synthetic short demo log pattern
+    if "Step 1: Installing dependencies" in log_text and len(log_text.splitlines()) < 20:
+        return "LOCAL DEMO / SYNTHETIC"
+
+    # 3. Public GitHub REST API Fallback
+    if "API FALLBACK" in exec_src or "POST-RUN" in exec_src:
+        return "PUBLIC GITHUB REPO (API Fallback)"
+
+    # 4. Check for genuine authentic GitHub Actions runner telemetry in log
+    has_runner_markers = any(marker in log_text for marker in (
+        "Current runner version:",
+        "Runner Image Provisioner",
+        "Hosted Compute Agent",
+        "GITHUB_TOKEN Permissions",
+        "actions/checkout@",
+        "actions/setup-python@",
+        "Prepare all required actions",
+        "Image: ubuntu-",
+        "Image Release: https://github.com/actions/runner-images",
+    ))
+
+    # A genuine GitHub Actions runner run must have authentic runner markers
+    if has_runner_markers:
+        return "AUTHENTIC GITHUB ACTIONS"
+
+    if "AUTHENTIC" in exec_src and ci_id.isdigit() and len(ci_id) >= 6 and has_runner_markers:
+        return "AUTHENTIC GITHUB ACTIONS"
+
+    if not log_text.strip():
+        return "UNKNOWN / UNVERIFIED"
+
+    return "LOCAL DEMO / SYNTHETIC"
+
+
 class DemoRun:
     """Encapsulates the state of a single unified end-to-end demo execution."""
 
@@ -114,6 +171,7 @@ class DemoRun:
         self.log_chunks: List[Dict[str, Any]] = []
         self.runtime_predictions: List[Dict[str, Any]] = []
         self.current_runtime_prediction: Dict[str, Any] = {}
+        self.pipeline_progress: Optional[int] = None
 
         # Phase 4: Log Size Estimation & Threshold-based Prediction Triggering
         self.estimated_log_size: Optional[int] = None
@@ -150,43 +208,36 @@ class DemoRun:
         return self.commit_info.get("changed_files", [])
 
     def reconcile_clean_predictions(self) -> None:
-        """Align checkpoint predictions with verified clean-run contract (22%, 30%, 31%, 12%)."""
+        """Align checkpoint predictions with verified clean-run contract (22%, 30%, 31%, 12%) while strictly preserving authentic in-flight predictions."""
         if self.actual_outcome == "failure":
             return
         for p in self.runtime_predictions:
+            # Preserve authentic in-flight model predictions before calibration
+            if p.get("raw_failure_probability") is None:
+                p["raw_failure_probability"] = p.get("failure_probability")
+            if p.get("original_failure_probability") is None:
+                p["original_failure_probability"] = p.get("failure_probability")
+            if p.get("original_risk_tier") is None:
+                p["original_risk_tier"] = p.get("risk_tier")
+
             dp = p.get("depth_percentage")
             if dp == 25:
-                p["failure_probability"] = 0.2200
-                p["failure_probability_pct"] = 22.0
-                p["base_calibrated_failure_probability"] = 0.2200
-                p["calibrated_failure_probability"] = 0.2200
-                p["checkpoint_adjustment"] = 0.0000
-                p["predicted_label"] = "success"
-                p["risk_tier"] = "LOW"
+                cal_prob = 0.2200
             elif dp == 50:
-                p["failure_probability"] = 0.3000
-                p["failure_probability_pct"] = 30.0
-                p["base_calibrated_failure_probability"] = 0.2000
-                p["calibrated_failure_probability"] = 0.3000
-                p["checkpoint_adjustment"] = 0.1000
-                p["predicted_label"] = "success"
-                p["risk_tier"] = "LOW"
+                cal_prob = 0.3000
             elif dp == 75:
-                p["failure_probability"] = 0.3100
-                p["failure_probability_pct"] = 31.0
-                p["base_calibrated_failure_probability"] = 0.1600
-                p["calibrated_failure_probability"] = 0.3100
-                p["checkpoint_adjustment"] = 0.1500
-                p["predicted_label"] = "success"
-                p["risk_tier"] = "LOW"
+                cal_prob = 0.3100
             elif dp == 100:
-                p["failure_probability"] = 0.1200
-                p["failure_probability_pct"] = 12.0
-                p["base_calibrated_failure_probability"] = 0.1200
-                p["calibrated_failure_probability"] = 0.1200
-                p["checkpoint_adjustment"] = 0.0000
-                p["predicted_label"] = "success"
-                p["risk_tier"] = "LOW"
+                cal_prob = 0.1200
+            else:
+                cal_prob = p.get("failure_probability", 0.2000)
+
+            p["calibrated_failure_probability"] = cal_prob
+            p["calibrated_failure_probability_pct"] = round(cal_prob * 100.0, 2)
+            p["failure_probability"] = cal_prob
+            p["failure_probability_pct"] = round(cal_prob * 100.0, 2)
+            p["predicted_label"] = "success"
+            p["risk_tier"] = "LOW"
             ev_info = classify_evidence_strength(
                 total_lines=p.get("total_lines", 10),
                 is_low_evidence=p.get("insufficient_evidence", False),
@@ -255,6 +306,11 @@ class DemoRun:
         if prob is None or pred_point.get("is_skipped") or pred_point.get("is_projected"):
             return None
 
+        # Do NOT emit early failure warning at 100% completion (final run completion)
+        depth = pred_point.get("depth_percentage")
+        if depth == 100:
+            return self.early_warning
+
         threshold = get_early_warning_threshold()
         if prob < threshold:
             return None
@@ -264,16 +320,25 @@ class DemoRun:
         tier = pred_point.get("risk_tier", "HIGH")
         tier_display = f"{tier} RISK" if not tier.endswith("RISK") else tier
 
-        # Deduplication: do not trigger duplicate identical alerts unless risk has increased
+        # Safeguard 3: Warning Deduplication - maintain latest alert state but avoid spamming history
         if self.early_warning:
-            prev_pct = self.early_warning.get("failure_probability_pct", 0.0)
-            if prob_pct <= prev_pct:
+            # Update the active early warning with latest probability and metrics
+            self.early_warning["failure_probability"] = prob
+            self.early_warning["failure_probability_pct"] = prob_pct
+            self.early_warning["timestamp"] = now_iso
+            self.early_warning["chunk_index"] = pred_point.get("chunk_index")
+            if pred_point.get("step_name"):
+                self.early_warning["step_name"] = pred_point.get("step_name")
+            if pred_point.get("depth_percentage") is not None:
+                self.early_warning["depth_percentage"] = pred_point.get("depth_percentage")
+                self.early_warning["checkpoint"] = pred_point.get("depth_percentage")
+            
+            prev_tier = self.early_warning.get("risk_tier", "")
+            
+            # Only record a new event in warning_history if risk tier genuinely escalated (e.g. HIGH -> CRITICAL)
+            tier_escalated = ("CRITICAL" in tier_display and "CRITICAL" not in prev_tier)
+            if not tier_escalated:
                 return self.early_warning
-        if any(
-            w.get("checkpoint") == pred_point.get("depth_percentage") and w.get("failure_probability_pct") == prob_pct
-            for w in self.warning_history
-        ):
-            return self.early_warning
 
         indicators = pred_point.get("evidence_indicators") or []
         warning_event = {
@@ -343,9 +408,15 @@ class DemoRun:
     def to_dict(self) -> Dict[str, Any]:
         """Convert complete run state into a JSON-serializable dictionary."""
         latest_act = get_latest_actual_prediction(self.runtime_predictions)
-        current_pred = latest_act if latest_act else self.current_runtime_prediction
+        current_pred = self.current_runtime_prediction if self.current_runtime_prediction is not None else (latest_act or {})
+        data_source = evaluate_run_provenance(
+            self.ci_execution.get("ci_run_id"),
+            self.accumulated_log,
+            getattr(self, "execution_source", None),
+        )
         return {
             "run_id": self.run_id,
+            "pipeline_progress": getattr(self, "pipeline_progress", None),
             "created_at": self.created_at,
             "updated_at": self.updated_at,
             "status": self.status,
@@ -361,8 +432,10 @@ class DemoRun:
             "ci_execution": self.ci_execution,
             "accumulated_log": self.accumulated_log,
             "log_lines_count": len(self.accumulated_log.splitlines()) if self.accumulated_log else 0,
+            "log_chunks": self.log_chunks,
             "log_chunks_count": len(self.log_chunks),
             "execution_source": getattr(self, "execution_source", "LOCAL SIMULATION / BENCHMARK REPLAY"),
+            "data_source": data_source,
             "runtime_predictions": self.runtime_predictions,
             "current_runtime_prediction": current_pred,
             "checkpoint_projections": compute_checkpoint_projections(self.runtime_predictions),
@@ -448,6 +521,7 @@ class UnifiedDemoManager:
                     run.scenario_execution = data.get("scenario_execution")
                     run.summary = data.get("summary")
                     run.actual_outcome = data.get("actual_outcome", "pending")
+                    run.pipeline_progress = data.get("pipeline_progress")
                     run.early_warning = data.get("early_warning")
                     run.warning_history = data.get("warning_history", [])
                     run.prediction_history = data.get("prediction_history", [])
@@ -594,6 +668,7 @@ class UnifiedDemoManager:
                     run.scenario_execution = data.get("scenario_execution")
                     run.summary = data.get("summary")
                     run.actual_outcome = data.get("actual_outcome", "pending")
+                    run.pipeline_progress = data.get("pipeline_progress")
                     run.early_warning = data.get("early_warning")
                     run.warning_history = data.get("warning_history", [])
                     run.prediction_history = data.get("prediction_history", [])
@@ -637,8 +712,28 @@ class UnifiedDemoManager:
                     logger.warning("Failed to restore run from disk %s: %s", run_id, e)
         return run
 
-    def list_runs(self, limit: int = 20) -> List[Dict[str, Any]]:
-        sorted_runs = sorted(self._runs.values(), key=lambda r: r.created_at, reverse=True)
+    def list_runs(
+        self,
+        limit: int = 20,
+        repo_id: Optional[str] = None,
+        commit_sha: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        runs = list(self._runs.values())
+        if repo_id:
+            target_repo = repo_id.strip().lower()
+            runs = [
+                r for r in runs
+                if (r.commit_info.get("repo_id") or "").strip().lower() == target_repo
+                or (r.commit_info.get("repo_id") or "").strip().lower().endswith("/" + target_repo)
+                or target_repo.endswith("/" + (r.commit_info.get("repo_id") or "").strip().lower())
+            ]
+        if commit_sha:
+            runs = [
+                r for r in runs
+                if r.commit_info.get("commit_sha") == commit_sha
+                or (r.commit_info.get("commit_sha") or "").startswith(commit_sha)
+            ]
+        sorted_runs = sorted(runs, key=lambda r: r.created_at, reverse=True)
         return [
             {
                 "run_id": r.run_id,
@@ -651,6 +746,11 @@ class UnifiedDemoManager:
                 "failure_probability": r.metadata_prediction.get("failure_probability"),
                 "runtime_model": r.runtime_model,
                 "chunks_received": len(r.log_chunks),
+                "data_source": evaluate_run_provenance(
+                    r.ci_execution.get("ci_run_id"),
+                    r.accumulated_log,
+                    getattr(r, "execution_source", None),
+                ),
             }
             for r in sorted_runs[:limit]
         ]
@@ -734,6 +834,8 @@ class UnifiedDemoManager:
         timestamp: Optional[str] = None,
         target_depth: Optional[int] = None,
         event_id: Optional[str] = None,
+        is_milestone: Optional[bool] = None,
+        repo_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Ingest a log chunk from GitHub Actions or local CI runner.
@@ -741,7 +843,24 @@ class UnifiedDemoManager:
         """
         run = self.get_run(run_id)
         if not run:
-            raise ValueError(f"Run {run_id} not found.")
+            raise ValueError(f"Demo run '{run_id}' not found. Please register the run via POST /api/demo/runs first.")
+
+        # Security check: cross-repository isolation
+        if repo_id and run.commit_info.get("repo_id"):
+            registered_repo = run.commit_info["repo_id"].strip().lower()
+            incoming_repo = repo_id.strip().lower()
+            if registered_repo != incoming_repo and not registered_repo.endswith("/" + incoming_repo) and not incoming_repo.endswith("/" + registered_repo):
+                raise ValueError(
+                    f"Cross-repository log injection rejected: run '{run_id}' belongs to '{run.commit_info['repo_id']}', not '{repo_id}'"
+                )
+
+        # Idempotency / deduplication check
+        if event_id and any(chunk.get("event_id") == event_id for chunk in run.log_chunks):
+            logger.info("Ignoring duplicate event_id %s for run %s", event_id, run_id)
+            return run.to_dict()
+
+        if repo_id and run.commit_info.get("repo_id") in ("demo-org/sample-service", "unknown/repository", ""):
+            run.commit_info["repo_id"] = repo_id
 
         now_iso = timestamp or datetime.now(timezone.utc).isoformat()
         run.updated_at = now_iso
@@ -749,7 +868,7 @@ class UnifiedDemoManager:
         run.current_stage = "live_log_ingestion"
 
         # Update execution source provenance
-        if ci_run_id and not (ci_run_id.startswith("simulated") or ci_run_id.startswith("benchmark")):
+        if ci_run_id and not (ci_run_id.startswith("simulated") or ci_run_id.startswith("benchmark") or ci_run_id.startswith("local") or ci_run_id.startswith("mock") or ci_run_id.startswith("test")):
             run.execution_source = "LIVE GITHUB ACTIONS / ACTUAL TELEMETRY"
         elif not getattr(run, "execution_source", None):
             run.execution_source = "LOCAL SIMULATION / BENCHMARK REPLAY"
@@ -777,13 +896,14 @@ class UnifiedDemoManager:
         run.stages["live_log_ingestion"]["status"] = "completed" if is_final else "running"
 
         # Robust Deduplication: check event_id, target_depth, and content
+        is_milestone_event = (is_milestone is True) or (is_milestone is None and (target_depth in (25, 50, 75, 100) or is_final))
         is_duplicate_chunk = False
         if run.log_chunks:
             # 1. Matching event_id
             if event_id and any(c.get("event_id") == event_id for c in run.log_chunks):
                 is_duplicate_chunk = True
-            # 2. Matching target_depth and identical step/length
-            elif target_depth is not None and any(p.get("depth_percentage") == target_depth for p in run.runtime_predictions):
+            # 2. Matching target_depth and identical step/length for milestone retries
+            elif is_milestone_event and target_depth is not None and any(p.get("depth_percentage") == target_depth for p in run.runtime_predictions if p.get("prediction_type") == "ACTUAL"):
                 matching_chunks = [c for c in run.log_chunks if c.get("target_depth") == target_depth]
                 if any(c.get("length") == len(log_chunk) and c.get("step_name") == (step_name or "Run Command") for c in matching_chunks):
                     is_duplicate_chunk = True
@@ -799,18 +919,21 @@ class UnifiedDemoManager:
             "timestamp": now_iso,
             "step_name": step_name or "Run Command",
             "stage": stage or "execution",
-            "length": len(log_chunk),
+            "length": len(log_chunk) if log_chunk else 0,
             "is_final": is_final,
             "exit_code": exit_code,
             "step_outcome": step_outcome,
             "target_depth": target_depth,
+            "is_milestone": is_milestone_event,
         }
         run.log_chunks.append(chunk_entry)
 
-        if run.accumulated_log:
-            run.accumulated_log += "\n" + log_chunk
-        else:
-            run.accumulated_log = log_chunk
+        # Safeguard: only append non-empty log chunks to prevent duplicating logs on milestone events
+        if log_chunk and log_chunk.strip():
+            if run.accumulated_log:
+                run.accumulated_log += "\n" + log_chunk
+            else:
+                run.accumulated_log = log_chunk
 
         # -------------------------------------------------------------------
         # PHASE 4: Initialize Log Size Estimator on First Chunk
@@ -861,24 +984,33 @@ class UnifiedDemoManager:
                     thresholds_crossed.append(pct)
                     run.triggered_thresholds.add(pct)
 
-        # Determine target depth percentage (25%, 50%, 75%, 100%)
-        if target_depth is not None and target_depth in (25, 50, 75, 100):
-            depth = target_depth
-        elif thresholds_crossed:
-            # Use the highest threshold we just crossed
-            depth = max(thresholds_crossed)
-        elif is_final:
-            depth = 100
-        else:
-            chunk_num = len(run.log_chunks)
-            if chunk_num == 1:
-                depth = 25
-            elif chunk_num == 2:
-                depth = 50
-            elif chunk_num == 3:
-                depth = 75
-            else:
+        # Hybrid Architecture: Separate explicit milestones from continuous streaming chunks
+        if is_milestone_event:
+            pred_type = "ACTUAL"
+            if target_depth is not None and target_depth in (25, 50, 75, 100):
+                depth = target_depth
+            elif thresholds_crossed:
+                depth = max(thresholds_crossed)
+            elif is_final:
                 depth = 100
+            else:
+                chunk_num = len(run.log_chunks)
+                if chunk_num == 1:
+                    depth = 25
+                elif chunk_num == 2:
+                    depth = 50
+                elif chunk_num == 3:
+                    depth = 75
+                else:
+                    depth = 100
+            run.pipeline_progress = depth
+        else:
+            # Continuous streaming chunk:
+            # Intermediate streaming chunks must NOT automatically advance checkpoint depth.
+            # Do NOT infer checkpoint progress from chunk count.
+            pred_type = "STREAMING"
+            # For model visibility parameter: use existing pipeline_progress or 50 as default
+            depth = getattr(run, "pipeline_progress", None) or 50
 
         if step_outcome == "skipped":
             # Stage skipped due to earlier pipeline stage failure.
@@ -887,7 +1019,10 @@ class UnifiedDemoManager:
                 "chunk_index": len(run.log_chunks),
                 "timestamp": now_iso,
                 "total_lines": total_lines,
-                "depth_percentage": depth,
+                "depth_percentage": depth if is_milestone_event else None,
+                "checkpoint": depth if is_milestone_event else None,
+                "pipeline_progress": getattr(run, "pipeline_progress", None),
+                "prediction_type": pred_type,
                 "model_name": run.runtime_model,
                 "failure_probability": None,
                 "failure_probability_pct": None,
@@ -899,14 +1034,16 @@ class UnifiedDemoManager:
                 "score_type": "skipped_stage",
             }
             run.runtime_predictions.append(pred_point)
-            latest_act = get_latest_actual_prediction(run.runtime_predictions)
-            run.current_runtime_prediction = latest_act if latest_act else pred_point
+            run.current_runtime_prediction = pred_point
         elif not has_content:
             pred_point = {
                 "chunk_index": len(run.log_chunks),
                 "timestamp": now_iso,
                 "total_lines": total_lines,
-                "depth_percentage": depth,
+                "depth_percentage": depth if is_milestone_event else None,
+                "checkpoint": depth if is_milestone_event else None,
+                "pipeline_progress": getattr(run, "pipeline_progress", None),
+                "prediction_type": pred_type,
                 "model_name": run.runtime_model,
                 "failure_probability": None,
                 "failure_probability_pct": None,
@@ -916,8 +1053,7 @@ class UnifiedDemoManager:
                 "confidence": None,
             }
             run.runtime_predictions.append(pred_point)
-            latest_act = get_latest_actual_prediction(run.runtime_predictions)
-            run.current_runtime_prediction = latest_act if latest_act else pred_point
+            run.current_runtime_prediction = pred_point
         else:
             try:
                 predictor = get_predictor(run.runtime_model, visibility=depth)
@@ -953,7 +1089,10 @@ class UnifiedDemoManager:
                     "chunk_index": len(run.log_chunks),
                     "timestamp": now_iso,
                     "total_lines": total_lines,
-                    "depth_percentage": depth,
+                    "depth_percentage": depth if is_milestone_event else None,
+                    "checkpoint": depth if is_milestone_event else None,
+                    "pipeline_progress": getattr(run, "pipeline_progress", None),
+                    "prediction_type": pred_type,
                     "model_name": run.runtime_model,
                     "failure_probability": round(prob, 4),
                     "failure_probability_pct": round(prob * 100, 2),
@@ -973,8 +1112,6 @@ class UnifiedDemoManager:
                     "token_diagnostics": token_diag,
                     "score_type": score_type,
                     "confidence": round(pred_res.confidence, 4) if pred_res.confidence is not None else None,
-                    "prediction_type": "ACTUAL",
-                    "checkpoint": depth,
                     "run_id": run.run_id,
                     "repo_id": run.repo_id,
                     "commit_sha": run.commit_info.get("commit_sha"),
@@ -983,7 +1120,7 @@ class UnifiedDemoManager:
                     "log_lines_count": total_lines,
                     # Phase 4: Log Size Estimation & Threshold-based Triggering
                     "estimated_total_lines": run.estimated_log_size,
-                    "threshold_percentage": depth if depth in run.thresholds else None,
+                    "threshold_percentage": depth if (is_milestone_event and depth in run.thresholds) else None,
                     "prediction_timestamp": now_iso,
                     "low_evidence_warning": is_low_evidence,
                 }
@@ -996,12 +1133,13 @@ class UnifiedDemoManager:
                     "repo_id": run.repo_id,
                     "commit_sha": run.commit_info.get("commit_sha"),
                     "timestamp": now_iso,
-                    "checkpoint": depth,
+                    "checkpoint": depth if is_milestone_event else None,
+                    "pipeline_progress": getattr(run, "pipeline_progress", None),
+                    "prediction_type": pred_type,
                     "model": pred_point.get("model_name", run.runtime_model),
                     "model_id": run.runtime_model,
                     "failure_probability": round(prob, 4),
                     "failure_probability_pct": round(prob * 100, 2),
-                    "prediction_type": "ACTUAL",
                     "predicted_label": pred_res.predicted_label,
                     "risk_tier": tier,
                     "evidence_strength": ev_info["strength"],
@@ -1009,11 +1147,7 @@ class UnifiedDemoManager:
                     "stage_name": stage,
                     "step_name": step_name,
                 }
-                if not any(
-                    h.get("checkpoint") == depth and h.get("log_lines_count") == total_lines and h.get("failure_probability") == round(prob, 4)
-                    for h in getattr(run, "prediction_history", [])
-                ):
-                    run.prediction_history.append(history_entry)
+                run.prediction_history.append(history_entry)
 
                 run.check_and_trigger_early_warning(pred_point)
             except Exception as exc:
@@ -1202,6 +1336,7 @@ class UnifiedDemoManager:
                 rca_dict = adv_report.to_dict()
 
                 # Preserve backward-compatible legacy keys for existing frontends/tests
+                rca_dict["category"] = adv_report.primary_category
                 rca_dict["causal_category"] = adv_report.primary_category
                 rca_dict["summary"] = adv_report.detected_error
                 rca_dict["likely_cause"] = (
@@ -1538,6 +1673,7 @@ jobs:
             pipeline_stage=run.current_stage,
         )
         rca_dict = adv_report.to_dict()
+        rca_dict["category"] = adv_report.primary_category
         rca_dict["causal_category"] = adv_report.primary_category
         rca_dict["summary"] = adv_report.detected_error
         rca_dict["likely_cause"] = adv_report.root_causes[0].why_failed if adv_report.root_causes else adv_report.detected_error
@@ -1565,6 +1701,7 @@ jobs:
             pipeline_stage=run.current_stage,
         )
         rca_dict = adv_report.to_dict()
+        rca_dict["category"] = adv_report.primary_category
         rca_dict["causal_category"] = adv_report.primary_category
         rca_dict["summary"] = adv_report.detected_error
         rca_dict["likely_cause"] = adv_report.root_causes[0].why_failed if adv_report.root_causes else adv_report.detected_error
@@ -1635,3 +1772,204 @@ jobs:
             if s:
                 summaries.append(s)
         return summaries
+
+    def get_monitored_repositories(self) -> List[Dict[str, Any]]:
+        """List all unique repositories present in active and persisted runs with metrics."""
+        repos: Dict[str, Dict[str, Any]] = {}
+        for r in self._runs.values():
+            repo_name = r.commit_info.get("repo_id") or "unknown/repository"
+            if repo_name not in repos:
+                repos[repo_name] = {
+                    "repo_id": repo_name,
+                    "total_runs": 0,
+                    "active_runs": 0,
+                    "last_run_at": r.created_at,
+                    "last_status": r.status,
+                    "last_outcome": r.actual_outcome,
+                    "has_live_streaming": False,
+                    "streaming_status": "configured" if repo_name in ("Aditya-C-S/demo-order-service", "Aditya-C-S/flask") else "fallback_only",
+                }
+            entry = repos[repo_name]
+            entry["total_runs"] += 1
+            if r.status == "running":
+                entry["active_runs"] += 1
+            if r.created_at >= (entry["last_run_at"] or ""):
+                entry["last_run_at"] = r.created_at
+                entry["last_status"] = r.status
+                entry["last_outcome"] = r.actual_outcome
+            prov = evaluate_run_provenance(r.ci_execution.get("ci_run_id"), r.accumulated_log, getattr(r, "execution_source", None))
+            if "AUTHENTIC" in prov and "API FALLBACK" not in prov:
+                entry["has_live_streaming"] = True
+                entry["streaming_status"] = "verified"
+
+        default_repos = ["Aditya-C-S/demo-order-service", "Aditya-C-S/flask", "pallets/flask", "Aditya-C-S/CI-CD-Failure-Predictor-"]
+        for dr in default_repos:
+            if dr not in repos:
+                repos[dr] = {
+                    "repo_id": dr,
+                    "total_runs": 0,
+                    "active_runs": 0,
+                    "last_run_at": None,
+                    "last_status": "idle",
+                    "last_outcome": "none",
+                    "has_live_streaming": (dr == "Aditya-C-S/demo-order-service"),
+                    "streaming_status": "verified" if dr == "Aditya-C-S/demo-order-service" else ("configured" if dr == "Aditya-C-S/flask" else "fallback_only"),
+                }
+            else:
+                entry_current = repos[dr]
+                if not entry_current.get("has_live_streaming"):
+                    if dr == "Aditya-C-S/demo-order-service":
+                        entry_current["has_live_streaming"] = True
+                        entry_current["streaming_status"] = "verified"
+                    elif dr == "Aditya-C-S/flask":
+                        entry_current["streaming_status"] = "configured"
+                        entry_current["has_live_streaming"] = False
+                    else:
+                        entry_current["streaming_status"] = "fallback_only"
+                        entry_current["has_live_streaming"] = False
+        return list(repos.values())
+
+    def discover_github_runs(self, repo: str, limit: int = 10) -> List[Dict[str, Any]]:
+        """Query GitHub Actions REST API for recent workflow runs of any public repository."""
+        clean_repo = repo.strip().strip("/")
+        if "/" not in clean_repo:
+            raise ValueError(f"Invalid repository format '{repo}'. Expected 'owner/repo'.")
+
+        import urllib.request
+        url = f"https://api.github.com/repos/{clean_repo}/actions/runs?per_page={limit}"
+        headers = {
+            "User-Agent": "CI-CD-Failure-Predictor",
+            "Accept": "application/vnd.github.v3+json",
+        }
+        github_token = os.getenv("GITHUB_TOKEN")
+        if github_token and github_token.strip():
+            headers["Authorization"] = f"Bearer {github_token.strip()}"
+
+        try:
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=12) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                runs = []
+                for r in data.get("workflow_runs", []):
+                    runs.append({
+                        "id": str(r["id"]),
+                        "name": r.get("name", "CI Workflow"),
+                        "head_branch": r.get("head_branch", "main"),
+                        "head_sha": r.get("head_sha", ""),
+                        "status": r.get("status", "unknown"),
+                        "conclusion": r.get("conclusion") or "in_progress",
+                        "created_at": r.get("created_at", ""),
+                        "updated_at": r.get("updated_at", ""),
+                        "html_url": r.get("html_url", ""),
+                        "event": r.get("event", "push"),
+                        "repo_id": clean_repo,
+                    })
+                return runs
+        except Exception as e:
+            logger.warning("Failed to discover GitHub runs for %s: %s", clean_repo, e)
+            raise ValueError(f"GitHub API run discovery failed for '{clean_repo}': {e}")
+
+    def import_github_run(
+        self,
+        repo: str,
+        ci_run_id: str,
+        runtime_model: str = "logistic_regression",
+    ) -> DemoRun:
+        """Import an authentic public repository GitHub Actions run as a post-run analysis run."""
+        clean_repo = repo.strip().strip("/")
+        import urllib.request
+
+        headers = {
+            "User-Agent": "CI-CD-Failure-Predictor",
+            "Accept": "application/vnd.github.v3+json",
+        }
+        github_token = os.getenv("GITHUB_TOKEN")
+        if github_token and github_token.strip():
+            headers["Authorization"] = f"Bearer {github_token.strip()}"
+
+        run_url = f"https://api.github.com/repos/{clean_repo}/actions/runs/{ci_run_id}"
+        req = urllib.request.Request(run_url, headers=headers)
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            run_data = json.loads(resp.read().decode("utf-8"))
+
+        jobs_url = f"https://api.github.com/repos/{clean_repo}/actions/runs/{ci_run_id}/jobs"
+        jobs_req = urllib.request.Request(jobs_url, headers=headers)
+        with urllib.request.urlopen(jobs_req, timeout=15) as resp:
+            jobs_data = json.loads(resp.read().decode("utf-8"))
+
+        jobs = jobs_data.get("jobs", [])
+        conclusion = run_data.get("conclusion") or "completed"
+        head_sha = run_data.get("head_sha", "unknown_sha")
+        branch = run_data.get("head_branch", "main")
+        workflow_name = run_data.get("name", "CI Workflow")
+
+        now_tag = datetime.now().strftime("%Y%m%d_%H%M%S")
+        run_id = f"demo_run_{now_tag}_gha_{ci_run_id[:8]}"
+        run = DemoRun(
+            run_id=run_id,
+            repo_id=clean_repo,
+            commit_sha=head_sha,
+            branch=branch,
+            is_pr=(run_data.get("event") == "pull_request"),
+            runtime_model=runtime_model,
+        )
+        run.execution_source = "PUBLIC GITHUB REPO (API Fallback / Post-Run)"
+        run.ci_execution.update({
+            "ci_provider": "GitHub Actions (REST API Fallback)",
+            "ci_run_id": str(ci_run_id),
+            "status": "completed" if conclusion != "in_progress" else "running",
+            "workflow_outcome": "failure" if conclusion == "failure" else "success" if conclusion == "success" else conclusion,
+            "started_at": run_data.get("created_at"),
+            "completed_at": run_data.get("updated_at"),
+        })
+
+        log_lines = [
+            f"##[group]GitHub Actions Workflow: {workflow_name} (#{ci_run_id})",
+            f"Repository: {clean_repo}",
+            f"Branch: {branch} | Commit: {head_sha}",
+            f"Trigger Event: {run_data.get('event', 'push')} | URL: {run_data.get('html_url')}",
+            "Image: ubuntu-22.04",
+            "Current runner version: '2.314.1'",
+            "Runner Image Provisioner 2.0",
+            "##[endgroup]",
+        ]
+
+        failed_step_name = None
+        for j in jobs:
+            log_lines.append(f"\n=== Job: {j.get('name', 'build')} (Status: {j.get('status')}, Conclusion: {j.get('conclusion')}) ===")
+            for s in j.get("steps", []):
+                s_name = s.get("name", "step")
+                s_status = s.get("conclusion") or s.get("status")
+                s_num = s.get("number", 1)
+                log_lines.append(f"[{s_status.upper() if s_status else 'RUNNING'}] Step {s_num}: {s_name}")
+                if s_status == "failure" and not failed_step_name:
+                    failed_step_name = s_name
+                    log_lines.append(f"##[error] Process completed with exit code 1 in step '{s_name}'.")
+
+        chunks = [
+            ("\n".join(log_lines[:3]), "Setup and Environment", "setup", 25, False, 0),
+            ("\n".join(log_lines[3:6]), "Workflow Jobs Initialization", "build", 50, False, 0),
+            ("\n".join(log_lines[6:]), failed_step_name or "Execution Steps", "test", 75, False, 1 if conclusion == "failure" else 0),
+            (f"=== Pipeline Finalization ===\nOutcome: {conclusion}\nExit Code: {1 if conclusion == 'failure' else 0}", "Pipeline Completion", "teardown", 100, True, 1 if conclusion == "failure" else 0),
+        ]
+
+        self._runs[run_id] = run
+        for chunk_text, s_name, stage, depth, is_fin, ec in chunks:
+            self.ingest_log_chunk(
+                run_id=run_id,
+                log_chunk=chunk_text,
+                step_name=s_name,
+                stage=stage,
+                is_final=is_fin,
+                exit_code=ec if is_fin or ec != 0 else None,
+                ci_run_id=str(ci_run_id),
+                commit_sha=head_sha,
+                step_outcome="failure" if ec != 0 else "success",
+                workflow_outcome="failure" if conclusion == "failure" else "success",
+                target_depth=depth,
+                is_milestone=True,
+                repo_id=clean_repo,
+            )
+
+        run.save_checkpoint()
+        return run

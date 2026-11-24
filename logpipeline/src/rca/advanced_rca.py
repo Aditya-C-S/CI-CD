@@ -44,6 +44,7 @@ class FailureCategory:
     DEPLOYMENT_FAILURE = "DEPLOYMENT_FAILURE"
     CONFIGURATION_FAILURE = "CONFIGURATION_FAILURE"
     INFRASTRUCTURE_FAILURE = "INFRASTRUCTURE_FAILURE"
+    LINT_TYPECHECK_FAILURE = "LINT_TYPECHECK_FAILURE"
     UNKNOWN = "UNKNOWN"
     INSUFFICIENT_EVIDENCE = "INSUFFICIENT_EVIDENCE"
 
@@ -56,6 +57,7 @@ ALL_CATEGORIES = [
     FailureCategory.DEPLOYMENT_FAILURE,
     FailureCategory.CONFIGURATION_FAILURE,
     FailureCategory.INFRASTRUCTURE_FAILURE,
+    FailureCategory.LINT_TYPECHECK_FAILURE,
     FailureCategory.UNKNOWN,
     FailureCategory.INSUFFICIENT_EVIDENCE,
 ]
@@ -216,6 +218,7 @@ class AdvancedRCAEngine:
         if isinstance(parsed_record, dict):
             p_class = parsed_record.get("failure_class")
             p_subcat = parsed_record.get("failure_subcategory")
+            p_type = parsed_record.get("error_type")
             p_file = parsed_record.get("file_path")
             p_line = parsed_record.get("line_number")
             p_msg = parsed_record.get("error_message")
@@ -227,6 +230,7 @@ class AdvancedRCAEngine:
         else:
             p_class = getattr(parsed_record, "failure_class", None)
             p_subcat = getattr(parsed_record, "failure_subcategory", None)
+            p_type = getattr(parsed_record, "error_type", None)
             p_file = getattr(parsed_record, "file_path", None)
             p_line = getattr(parsed_record, "line_number", None)
             p_msg = getattr(parsed_record, "error_message", None)
@@ -333,18 +337,97 @@ class AdvancedRCAEngine:
         # 3. Classify Failure Category & Diagnose Root Cause
         category = FailureCategory.UNKNOWN
         classification_method = "PARSER_V2_AST" if p_class else "LOG_HEURISTIC"
-        detected_error = p_msg or p_matched or "Unspecified failure"
+        if p_type and p_msg:
+            detected_error = f"{p_type}: {p_msg}" if p_type not in p_msg else p_msg
+        else:
+            detected_error = p_msg or p_type or p_matched or "Unspecified failure"
         matched_evidence = p_matched or (evidence_items[0].error_text if evidence_items else "No evidence")
         evidence_strength = "LIMITED"
         rca_confidence = 0.50
         confidence_rationale = ""
 
-        # --- A. DEPENDENCY FAILURE ---
-        if p_class == "dependency_error" or re.search(
-            r"Could not find a version that satisfies the requirement|No matching distribution found|ModuleNotFoundError|ImportError|pip install.*failed",
-            log_text,
-            re.IGNORECASE,
-        ):
+        # --- 3. Classify Failure Category & Diagnose Root Cause ---
+        # Structured Parser V2 classifications take precedence over raw regex fallback
+        if p_class == "test_failure":
+            category = FailureCategory.TEST_FAILURE
+            classification_method = "PARSER_V2_TEST_ANALYZER"
+            evidence_strength = "STRONG" if "AssertionError" in log_text or (p_msg and "AssertionError" in p_msg) else "MODERATE"
+            rca_confidence = 0.95 if p_file and p_line else 0.92
+            confidence_rationale = (
+                "Parser V2 unit/integration test analyzer reported failed test assertions."
+            )
+            what_failed = "Automated test suite failed assertions."
+            where_failed = f"{p_file or 'tests/'}" + (f":{p_line}" if p_line else "")
+            why_failed = f"Test assertion mismatch: {p_msg or p_matched or 'AssertionError during test execution'}."
+            is_confirmed = True
+
+            root_causes.append(
+                RootCauseCandidate(
+                    cause_id="rc_1",
+                    category=category,
+                    what_failed=what_failed,
+                    where_failed=where_failed,
+                    why_failed=why_failed,
+                    is_confirmed=is_confirmed,
+                    evidence_strength=evidence_strength,
+                    confidence=rca_confidence,
+                    supporting_evidence_ids=[ev.evidence_id for ev in evidence_items],
+                    remediation_suggestions=[
+                        {
+                            "type": "CONFIRMED_FIX",
+                            "action": f"Inspect failing test assertion in {where_failed} and correct code or expectations.",
+                            "command": f"pytest {p_file or 'tests/'} -v",
+                        },
+                        {
+                            "type": "TROUBLESHOOTING",
+                            "action": "Inspect test traceback and local state transitions.",
+                            "command": "pytest --tb=short",
+                        },
+                    ],
+                )
+            )
+
+        elif p_class == "syntax_error":
+            category = FailureCategory.SYNTAX_FAILURE
+            classification_method = "PARSER_V2_SYNTAX_PARSER"
+            evidence_strength = "STRONG" if p_file and p_line else "MODERATE"
+            rca_confidence = 0.95 if p_file and p_line else 0.88
+            loc_str = f"{p_file}:{p_line}" if p_file and p_line else "source file"
+            confidence_rationale = (
+                f"Definitive syntax exception identified at {loc_str} with AST error details."
+            )
+            what_failed = f"Python syntax / grammar parsing failed in {loc_str}."
+            where_failed = f"{loc_str} in stage '{resolved_stage}'"
+            why_failed = f"Invalid Python syntax: {p_msg or p_matched or 'unexpected token or unclosed delimiter'}."
+            is_confirmed = True
+
+            root_causes.append(
+                RootCauseCandidate(
+                    cause_id="rc_1",
+                    category=category,
+                    what_failed=what_failed,
+                    where_failed=where_failed,
+                    why_failed=why_failed,
+                    is_confirmed=is_confirmed,
+                    evidence_strength=evidence_strength,
+                    confidence=rca_confidence,
+                    supporting_evidence_ids=[ev.evidence_id for ev in evidence_items],
+                    remediation_suggestions=[
+                        {
+                            "type": "CONFIRMED_FIX",
+                            "action": f"Inspect line {p_line or 'N/A'} of {p_file or 'the failing file'} and correct syntax.",
+                            "command": f"python -m py_compile {p_file or '*.py'}",
+                        },
+                        {
+                            "type": "TROUBLESHOOTING",
+                            "action": "Run a linter across the repository to verify file formatting.",
+                            "command": "ruff check .",
+                        },
+                    ],
+                )
+            )
+
+        elif p_class == "dependency_error":
             category = FailureCategory.DEPENDENCY_FAILURE
             classification_method = "PARSER_V2_DEPENDENCY_RULE"
             evidence_strength = "STRONG" if p_matched or "Could not find a version" in log_text else "MODERATE"
@@ -385,17 +468,97 @@ class AdvancedRCAEngine:
                 )
             )
 
-        # --- B. SYNTAX FAILURE ---
-        elif p_class == "syntax_error" or re.search(
+        elif p_class == "docker_build_failure":
+            category = FailureCategory.BUILD_FAILURE
+            classification_method = "PARSER_V2_BUILD_RULES"
+            evidence_strength = "STRONG"
+            rca_confidence = 0.90
+            confidence_rationale = "Docker / Compiler build step produced fatal build error."
+            what_failed = "Container or project compilation build step failed."
+            where_failed = f"Build step: {p_step or 'Docker Build'}"
+            why_failed = f"Build failure: {p_msg or p_matched or 'Docker build context or build instruction failed'}."
+            is_confirmed = True
+
+            root_causes.append(
+                RootCauseCandidate(
+                    cause_id="rc_1",
+                    category=category,
+                    what_failed=what_failed,
+                    where_failed=where_failed,
+                    why_failed=why_failed,
+                    is_confirmed=is_confirmed,
+                    evidence_strength=evidence_strength,
+                    confidence=rca_confidence,
+                    supporting_evidence_ids=[ev.evidence_id for ev in evidence_items],
+                    remediation_suggestions=[
+                        {
+                            "type": "CONFIRMED_FIX",
+                            "action": "Verify Dockerfile instruction syntax and local build context paths.",
+                            "command": "docker build -t test-build .",
+                        },
+                        {
+                            "type": "TROUBLESHOOTING",
+                            "action": "Ensure all files copied by COPY/ADD directives exist in context.",
+                            "command": "git status",
+                        },
+                    ],
+                )
+            )
+
+        # --- Heuristic Raw Log Regex Fallbacks (When Parser V2 does not provide authoritative classification) ---
+        elif re.search(
+            r"Could not find a version that satisfies the requirement|No matching distribution found|pip install.*failed|^\s*(ModuleNotFoundError|ImportError):",
+            log_text,
+            re.MULTILINE,
+        ):
+            category = FailureCategory.DEPENDENCY_FAILURE
+            classification_method = "LOG_HEURISTIC_DEPENDENCY"
+            evidence_strength = "STRONG" if "Could not find a version" in log_text else "MODERATE"
+            rca_confidence = 0.90 if "Could not find a version" in log_text else 0.82
+            confidence_rationale = (
+                f"Heuristic pattern match for dependency or module import exception."
+            )
+            what_failed = "Python dependency installation or module resolution failed."
+            where_failed = f"Stage: {resolved_stage}" + (f", Step: {p_step}" if p_step else "")
+            why_failed = "Package resolution or unhandled import error detected in raw log stream."
+            is_confirmed = True
+
+            root_causes.append(
+                RootCauseCandidate(
+                    cause_id="rc_1",
+                    category=category,
+                    what_failed=what_failed,
+                    where_failed=where_failed,
+                    why_failed=why_failed,
+                    is_confirmed=is_confirmed,
+                    evidence_strength=evidence_strength,
+                    confidence=rca_confidence,
+                    supporting_evidence_ids=[ev.evidence_id for ev in evidence_items],
+                    remediation_suggestions=[
+                        {
+                            "type": "CONFIRMED_FIX",
+                            "action": "Verify package name spelling and compatible version constraints in requirements.txt.",
+                            "command": "pip check && pip install -r requirements.txt --dry-run",
+                        },
+                        {
+                            "type": "TROUBLESHOOTING",
+                            "action": "Ensure the target package exists on PyPI and supports Python 3.12.",
+                            "command": "pip index versions <package_name>",
+                        },
+                    ],
+                )
+            )
+
+        elif re.search(
             r"\b(SyntaxError|IndentationError|TabError)\b", log_text
         ):
             category = FailureCategory.SYNTAX_FAILURE
-            classification_method = "PARSER_V2_SYNTAX_PARSER"
+            classification_method = "LOG_HEURISTIC_SYNTAX"
             evidence_strength = "STRONG" if p_file and p_line else "MODERATE"
             rca_confidence = 0.95 if p_file and p_line else 0.88
             loc_str = f"{p_file}:{p_line}" if p_file and p_line else "source file"
             confidence_rationale = (
-                f"Definitive syntax exception identified at {loc_str} with AST error details."
+                f"Definitive syntax exception identified in log text at {loc_str}."
             )
             what_failed = f"Python syntax / grammar parsing failed in {loc_str}."
             where_failed = f"{loc_str} in stage '{resolved_stage}'"
@@ -428,16 +591,16 @@ class AdvancedRCAEngine:
                 )
             )
 
-        # --- C. TEST FAILURE ---
-        elif p_class == "test_failure" or re.search(
-            r"\b(FAILURES|FAILED|AssertionError)\b.*(?:test_|tests/)", log_text
-        ) or "pytest" in log_text and re.search(r"=+\s+FAILURES\s+=+", log_text):
+        elif (
+            re.search(r"\b(FAILURES|FAILED|AssertionError)\b.*(?:test_|tests/)", log_text)
+            or ("pytest" in log_text and re.search(r"=+\s+FAILURES\s+=+", log_text))
+        ):
             category = FailureCategory.TEST_FAILURE
-            classification_method = "PARSER_V2_TEST_ANALYZER"
+            classification_method = "LOG_HEURISTIC_TEST_ANALYZER"
             evidence_strength = "STRONG" if "AssertionError" in log_text else "MODERATE"
-            rca_confidence = 0.92
+            rca_confidence = 0.90
             confidence_rationale = (
-                f"Unit/Integration test runner (pytest) reported failed test assertions."
+                f"Unit/Integration test runner (pytest) reported failed test assertions in log stream."
             )
             what_failed = "Automated test suite failed assertions."
             where_failed = f"{p_file or 'tests/'}" + (f":{p_line}" if p_line else "")
@@ -470,16 +633,15 @@ class AdvancedRCAEngine:
                 )
             )
 
-        # --- D. BUILD FAILURE ---
-        elif p_class == "docker_build_failure" or re.search(
+        elif re.search(
             r"failed to solve|COPY failed|dockerfile parse error|Cannot connect to the Docker daemon|build step failed",
             log_text,
             re.IGNORECASE,
         ):
             category = FailureCategory.BUILD_FAILURE
-            classification_method = "PARSER_V2_BUILD_RULES"
+            classification_method = "LOG_HEURISTIC_BUILD_RULES"
             evidence_strength = "STRONG"
-            rca_confidence = 0.90
+            rca_confidence = 0.88
             confidence_rationale = "Docker / Compiler build step produced fatal build error."
             what_failed = "Container or project compilation build step failed."
             where_failed = f"Build step: {p_step or 'Docker Build'}"
@@ -592,20 +754,59 @@ class AdvancedRCAEngine:
             )
 
         # --- G. INFRASTRUCTURE / ENVIRONMENT FAILURE ---
-        elif p_class == "timeout" or re.search(
-            r"has timed out|operation was canceled because it has timed out|runner lost communication|Terminate orphan process",
-            log_text,
-            re.IGNORECASE,
+        elif (
+            p_class in ("timeout", "network_service_failure")
+            or p_subcat in ("http_gateway_error", "gha_timeout")
+            or re.search(
+                r"has timed out|operation was canceled because it has timed out|The operation was aborted due to timeout|Unexpected HTTP response:\s*(?:5\d\d|408)|runner lost communication|Terminate orphan process",
+                log_text,
+                re.IGNORECASE,
+            )
         ):
             category = FailureCategory.INFRASTRUCTURE_FAILURE
-            classification_method = "PARSER_V2_TIMEOUT_ANALYZER"
-            evidence_strength = "STRONG" if "timed out" in log_text else "MODERATE"
-            rca_confidence = 0.88
-            confidence_rationale = "Workflow execution timeout or runner host cancellation detected."
-            what_failed = "Runner environment timed out or lost connectivity."
-            where_failed = f"Runner step: {p_step or 'Pipeline Execution'}"
-            why_failed = "Pipeline execution exceeded timeout threshold or runner was terminated."
-            is_confirmed = True
+            classification_method = "PARSER_V2_INFRASTRUCTURE_ANALYZER"
+            is_gateway = "http" in (p_subcat or "").lower() or bool(re.search(r"Unexpected HTTP response", log_text, re.IGNORECASE))
+            
+            if is_gateway:
+                evidence_strength = "STRONG"
+                rca_confidence = 0.92
+                confidence_rationale = "External dependency server or GitHub tool cache returned HTTP 504/gateway timeout."
+                what_failed = "GitHub Actions runner or external tool cache encountered HTTP gateway error."
+                where_failed = f"Runner step: {p_step or 'Tool / Dependency Download'}"
+                why_failed = f"Upstream server timeout: {p_msg or p_matched or 'HTTP 504 Gateway Timeout while fetching build tools'}."
+                is_confirmed = True
+                suggestions = [
+                    {
+                        "type": "CONFIRMED_FIX",
+                        "action": "Retry workflow run; external service returned upstream gateway timeout.",
+                        "command": "gh run rerun <run_id> --failed",
+                    },
+                    {
+                        "type": "TROUBLESHOOTING",
+                        "action": "Cache tool binaries locally or configure mirror fallback in action runner.",
+                        "command": "gh run view <run_id> --log-failed",
+                    },
+                ]
+            else:
+                evidence_strength = "STRONG" if "timed out" in log_text else "MODERATE"
+                rca_confidence = 0.90
+                confidence_rationale = "Workflow execution timeout or runner host cancellation detected."
+                what_failed = "Runner environment timed out or lost connectivity."
+                where_failed = f"Runner step: {p_step or 'Pipeline Execution'}"
+                why_failed = f"Operation aborted due to timeout: {p_msg or p_matched or 'Step exceeded runner timeout threshold'}."
+                is_confirmed = True
+                suggestions = [
+                    {
+                        "type": "CONFIRMED_FIX",
+                        "action": "Increase step timeout or configure HTTP client retries/timeout in action runner.",
+                        "command": "timeout-minutes: 15",
+                    },
+                    {
+                        "type": "TROUBLESHOOTING",
+                        "action": "Profile hanging network/compute calls during runner setup.",
+                        "command": "gh run view <run_id> --job <job_id>",
+                    },
+                ]
 
             root_causes.append(
                 RootCauseCandidate(
@@ -618,17 +819,100 @@ class AdvancedRCAEngine:
                     evidence_strength=evidence_strength,
                     confidence=rca_confidence,
                     supporting_evidence_ids=[ev.evidence_id for ev in evidence_items],
-                    remediation_suggestions=[
-                        {
-                            "type": "TROUBLESHOOTING",
-                            "action": "Increase step timeout or profile hanging network/compute calls.",
-                            "command": "timeout-minutes: 15",
-                        }
-                    ],
+                    remediation_suggestions=suggestions,
                 )
             )
 
-        # --- H. UNKNOWN / INSUFFICIENT EVIDENCE ---
+        # --- H. LINT / TYPECHECK / SECURITY POLICY FAILURE ---
+        elif (
+            p_class == "lint_typecheck_failure"
+            or p_subcat in ("mypy_type_error", "pre_commit_hook_failure", "zizmor_security_finding", "typing_failed")
+            or re.search(r"([^\s:]+\.py):\d+:\s*error:\s*.+", log_text)
+            or re.search(r"\btyping:\s*FAIL code\s+[1-9]\d*", log_text)
+            or re.search(r"\b(?:black|flake8|ruff|mypy|check-yaml)\.*(?:Failed|FAILED)\b", log_text)
+            or re.search(r"##\[error\]\s*zizmor", log_text)
+        ):
+            category = FailureCategory.LINT_TYPECHECK_FAILURE
+            classification_method = "PARSER_V2_LINT_TYPECHECK_ANALYZER"
+
+            if p_subcat == "mypy_type_error" or re.search(r"([^\s:]+\.py):\d+:\s*error:\s*.+", log_text):
+                evidence_strength = "STRONG" if p_file and p_line else "MODERATE"
+                rca_confidence = 0.95 if p_file and p_line else 0.88
+                loc_str = f"{p_file}:{p_line}" if p_file and p_line else "source file"
+                confidence_rationale = f"Static type checker (mypy) identified type error at {loc_str}."
+                what_failed = f"Static type checking (mypy) failed in {p_file or 'source files'}."
+                where_failed = f"{loc_str} in stage '{resolved_stage}'"
+                why_failed = f"Type check violation: {p_msg or p_matched or 'Incompatible types detected'}."
+                suggestions = [
+                    {
+                        "type": "CONFIRMED_FIX",
+                        "action": f"Fix type annotation in {loc_str}.",
+                        "command": f"mypy {p_file or 'src/'}",
+                    },
+                    {
+                        "type": "TROUBLESHOOTING",
+                        "action": "Run type check across codebase with detailed error codes.",
+                        "command": "mypy --show-error-codes --pretty",
+                    },
+                ]
+            elif p_subcat == "zizmor_security_finding" or re.search(r"##\[error\]\s*zizmor", log_text):
+                evidence_strength = "STRONG"
+                rca_confidence = 0.92
+                loc_str = p_file or ".github/workflows/"
+                confidence_rationale = f"GitHub Actions security audit (zizmor) flagged security findings in {loc_str}."
+                what_failed = "GitHub Actions security audit (zizmor) identified policy/security violations."
+                where_failed = f"Workflow file: {loc_str}"
+                why_failed = f"Security audit finding: {p_msg or p_matched or 'Vulnerable action syntax or unpinned actions'}."
+                suggestions = [
+                    {
+                        "type": "CONFIRMED_FIX",
+                        "action": f"Review and address zizmor security findings in {loc_str}.",
+                        "command": f"zizmor {loc_str}",
+                    },
+                    {
+                        "type": "TROUBLESHOOTING",
+                        "action": "Pin action dependencies to full 40-character commit SHAs and restrict token permissions.",
+                        "command": "gh workflow view",
+                    },
+                ]
+            else:
+                # Pre-commit hook or general linter failure
+                evidence_strength = "STRONG"
+                rca_confidence = 0.90
+                confidence_rationale = "Pre-commit linter/formatter hooks failed verification."
+                what_failed = f"Pre-commit hook validation failed ({p_subcat or 'linter/formatter'})."
+                where_failed = f"Stage: {resolved_stage}, Step: {p_step or 'pre-commit'}"
+                why_failed = f"Pre-commit checks detected unformatted or non-compliant files: {p_msg or p_matched or 'Hook failed'}."
+                suggestions = [
+                    {
+                        "type": "CONFIRMED_FIX",
+                        "action": "Format files and fix linter findings locally using pre-commit.",
+                        "command": "pre-commit run --all-files",
+                    },
+                    {
+                        "type": "TROUBLESHOOTING",
+                        "action": "Inspect git diff to see modified files.",
+                        "command": "git status && git diff",
+                    },
+                ]
+
+            is_confirmed = True
+            root_causes.append(
+                RootCauseCandidate(
+                    cause_id="rc_1",
+                    category=category,
+                    what_failed=what_failed,
+                    where_failed=where_failed,
+                    why_failed=why_failed,
+                    is_confirmed=is_confirmed,
+                    evidence_strength=evidence_strength,
+                    confidence=rca_confidence,
+                    supporting_evidence_ids=[ev.evidence_id for ev in evidence_items],
+                    remediation_suggestions=suggestions,
+                )
+            )
+
+        # --- I. UNKNOWN / INSUFFICIENT EVIDENCE ---
         else:
             if re.search(r"exit code [1-9]|##\[error\]", log_text):
                 category = FailureCategory.UNKNOWN

@@ -91,6 +91,7 @@ def compute_checkpoint_projections(
             and p.get("failure_probability") is not None
             and not p.get("is_skipped")
             and not p.get("is_projected")
+            and p.get("prediction_type", "ACTUAL") in ("ACTUAL", "FINAL_ACTUAL", "EVALUATED")
         ):
             actual_by_depth[dp] = p
 
@@ -124,6 +125,8 @@ def compute_checkpoint_projections(
             results[d] = {
                 "depth_percentage": d,
                 "type": "ACTUAL",
+                "label": "Evaluated",
+                "status_text": "Model inference on available log slice",
                 "is_projected": False,
                 "failure_probability_pct": pct,
                 "failure_probability": round(prob, 4),
