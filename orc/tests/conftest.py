@@ -52,6 +52,8 @@ def temp_checkpoint_db():
                 prediction_result TEXT,
                 graph_files_changed TEXT,
                 graph_sync_result TEXT,
+                suspicious_files TEXT,
+                processing_time_ms REAL,
                 error TEXT,
                 retry_count INTEGER DEFAULT 0,
                 created_at TEXT NOT NULL,

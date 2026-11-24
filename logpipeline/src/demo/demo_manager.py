@@ -425,6 +425,7 @@ class DemoRun:
             "actual_outcome": self.actual_outcome,
             "stages": self.stages,
             "commit_info": self.commit_info,
+            "branch": self.commit_info.get("branch", "main"),
             "scenario_preset": self.scenario_preset,
             "feature_lineage": self.feature_lineage,
             "metadata_prediction": self.metadata_prediction,
@@ -563,7 +564,7 @@ class UnifiedDemoManager:
         self,
         repo_id: str = "demo-org/sample-service",
         commit_sha: Optional[str] = None,
-        branch: str = "main",
+        branch: Optional[str] = None,
         is_pr: bool = True,
         changed_files: Optional[List[str]] = None,
         scenario_preset: str = "high_risk",
@@ -602,11 +603,27 @@ class UnifiedDemoManager:
                 repo_path_obj = _PROJECT_ROOT
 
         commit_info = GitMetadataExtractor.get_commit_info(repo_path_obj, commit_sha)
+
+        # Authoritative branch resolution:
+        # 1. Preserve explicitly supplied, non-empty branch from the registration request
+        # 2. Use extracted Git branch metadata only when no branch was supplied and the metadata is valid (available=True)
+        # 3. Do not treat fallback metadata (available=False) as authoritative
+        # 4. Fall back to commit_info branch or "main" only if neither is present
+        is_git_valid = bool(commit_info.get("available"))
+        git_discovered_branch = commit_info.get("branch") if is_git_valid else None
+
+        if branch and branch.strip():
+            authoritative_branch = branch.strip()
+        elif git_discovered_branch and git_discovered_branch.strip():
+            authoritative_branch = git_discovered_branch.strip()
+        else:
+            authoritative_branch = commit_info.get("branch") or "main"
+
         run.commit_info.update({
             "author": commit_info.get("author", "demo-author"),
             "timestamp": commit_info.get("timestamp"),
             "message": commit_info.get("message", "CI/CD update commit"),
-            "branch": commit_info.get("branch", branch),
+            "branch": authoritative_branch,
         })
         if commit_info.get("commit_sha") and not commit_sha:
             run.commit_info["commit_sha"] = commit_info["commit_sha"]

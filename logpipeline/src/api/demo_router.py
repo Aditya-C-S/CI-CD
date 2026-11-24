@@ -18,7 +18,7 @@ import logging
 import os
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Header, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
 from src.demo.demo_manager import UnifiedDemoManager
@@ -29,10 +29,74 @@ logger = logging.getLogger("demo_api")
 router = APIRouter(prefix="/api/demo", tags=["Unified End-to-End Demo"])
 
 
+def get_configured_api_key() -> Optional[str]:
+    """
+    Retrieve configured DEMO_API_KEY with strict precedence:
+    1. Explicit process environment variable (os.environ['DEMO_API_KEY']) takes precedence if non-empty.
+    2. Fallback to reading .env file ONLY if process environment variable is absent.
+    3. Empty string / whitespace is treated as unconfigured (None) - fail closed.
+    4. If unconfigured, returns None.
+    """
+    # 1. Process environment variable has top priority
+    if "DEMO_API_KEY" in os.environ:
+        proc_key = os.environ.get("DEMO_API_KEY", "")
+        cleaned = proc_key.strip()
+        return cleaned if cleaned else None
+
+    # 2. Fallback to .env file when process environment variable is absent
+    try:
+        from src.config import PROJECT_ROOT
+        env_file = PROJECT_ROOT / ".env"
+        if env_file.exists():
+            from dotenv import dotenv_values
+            env_vals = dotenv_values(env_file)
+            val = env_vals.get("DEMO_API_KEY")
+            if val is not None:
+                cleaned = str(val).strip()
+                return cleaned if cleaned else None
+    except Exception:
+        pass
+
+    return None
+
+
+def require_api_key(
+    x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
+    authorization: Optional[str] = Header(default=None),
+) -> str:
+    """
+    FastAPI security dependency ensuring fail-closed authentication:
+    - If backend DEMO_API_KEY is not configured or empty -> HTTP 503 Service Unavailable.
+    - If request token is missing or does not match -> HTTP 401 Unauthorized.
+    - Never logs or exposes API key values.
+    """
+    configured_key = get_configured_api_key()
+    if not configured_key:
+        raise HTTPException(
+            status_code=503,
+            detail="Authentication Service Unavailable: Backend DEMO_API_KEY is not configured.",
+        )
+
+    token = x_api_key
+    if not token and authorization:
+        if authorization.lower().startswith("bearer "):
+            token = authorization[7:].strip()
+        else:
+            token = authorization.strip()
+
+    if not token or token != configured_key:
+        raise HTTPException(
+            status_code=401,
+            detail="Unauthorized: Invalid or missing API key.",
+        )
+
+    return token
+
+
 class CreateRunRequest(BaseModel):
     repo_id: str = Field(default="demo-org/sample-service", description="Repository identifier (owner/repo or local name)")
     commit_sha: Optional[str] = Field(default=None, description="Commit SHA to analyze (or HEAD)")
-    branch: str = Field(default="main", description="Target Git branch")
+    branch: Optional[str] = Field(default=None, description="Target Git branch")
     is_pr: bool = Field(default=True, description="Whether this execution is triggered by a Pull Request")
     changed_files: Optional[List[str]] = Field(default=None, description="List of modified files in the commit/PR")
     scenario_preset: str = Field(default="high_risk", description="Benchmark scenario for historical/CI defaults")
@@ -54,6 +118,9 @@ class IngestLogChunkRequest(BaseModel):
     workflow_outcome: Optional[str] = Field(default=None, description="Overall CI workflow outcome (success, failure)")
     timestamp: Optional[str] = Field(default=None, description="Timestamp of the checkpoint report")
     depth: Optional[int] = Field(default=None, description="Target pipeline depth percentage (25, 50, 75, 100)")
+    is_milestone: Optional[bool] = Field(default=None, description="Explicit checkpoint milestone flag (25%, 50%, 75%, 100%)")
+    repo_id: Optional[str] = Field(default=None, description="Repository identifier (owner/repo)")
+    run_attempt: Optional[str] = Field(default=None, description="GitHub Actions run attempt")
 
 
 class ReplaySampleRequest(BaseModel):
@@ -62,7 +129,7 @@ class ReplaySampleRequest(BaseModel):
 
 
 @router.post("/runs")
-def create_demo_run(req: CreateRunRequest) -> Dict[str, Any]:
+def create_demo_run(req: CreateRunRequest, _auth: str = Depends(require_api_key)) -> Dict[str, Any]:
     """Initialize a unified demo execution run."""
     mgr = UnifiedDemoManager.get_instance()
     run = mgr.create_run(
@@ -80,10 +147,59 @@ def create_demo_run(req: CreateRunRequest) -> Dict[str, Any]:
 
 
 @router.get("/runs")
-def list_demo_runs(limit: int = Query(default=20, ge=1, le=100)) -> List[Dict[str, Any]]:
+def list_demo_runs(
+    limit: int = Query(default=20, ge=1, le=100),
+    repo: Optional[str] = Query(default=None, description="Optional repository filter"),
+    commit: Optional[str] = Query(default=None, description="Optional commit SHA filter"),
+) -> List[Dict[str, Any]]:
     """List recent unified demo runs."""
     mgr = UnifiedDemoManager.get_instance()
-    return mgr.list_runs(limit=limit)
+    return mgr.list_runs(limit=limit, repo_id=repo, commit_sha=commit)
+
+
+@router.get("/monitored-repos")
+def list_monitored_repositories() -> List[Dict[str, Any]]:
+    """Retrieve list of monitored repositories with active/historical run counts."""
+    mgr = UnifiedDemoManager.get_instance()
+    return mgr.get_monitored_repositories()
+
+
+class ImportGitHubRunRequest(BaseModel):
+    repo: str = Field(..., description="GitHub repository (owner/repo)")
+    ci_run_id: str = Field(..., description="GitHub Actions Run ID (numeric)")
+    runtime_model: str = Field(default="logistic_regression", description="Runtime prediction model")
+
+
+@router.get("/github/runs")
+def discover_github_runs(
+    repo: str = Query(..., description="GitHub repository (owner/repo)"),
+    limit: int = Query(default=10, ge=1, le=50),
+) -> List[Dict[str, Any]]:
+    """Discover recent GitHub Actions runs for any public repository using GitHub REST API."""
+    mgr = UnifiedDemoManager.get_instance()
+    try:
+        return mgr.discover_github_runs(repo=repo, limit=limit)
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
+    except Exception as e:
+        logger.exception("GitHub run discovery failed: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/github/import-run")
+def import_github_run(req: ImportGitHubRunRequest, _auth: str = Depends(require_api_key)) -> Dict[str, Any]:
+    """Import and analyze an external public GitHub Actions run via GitHub REST API fallback."""
+    mgr = UnifiedDemoManager.get_instance()
+    try:
+        run = mgr.import_github_run(
+            repo=req.repo,
+            ci_run_id=req.ci_run_id,
+            runtime_model=req.runtime_model,
+        )
+        return run.to_dict()
+    except Exception as e:
+        logger.exception("Failed to import GitHub run: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.get("/runs/{run_id}")
@@ -97,7 +213,7 @@ def get_demo_run(run_id: str) -> Dict[str, Any]:
 
 
 @router.post("/runs/{run_id}/metadata")
-def execute_run_metadata(run_id: str) -> Dict[str, Any]:
+def execute_run_metadata(run_id: str, _auth: str = Depends(require_api_key)) -> Dict[str, Any]:
     """Execute pre-build LightGBM failure prediction and TreeSHAP explainer for this run."""
     mgr = UnifiedDemoManager.get_instance()
     try:
@@ -110,7 +226,7 @@ def execute_run_metadata(run_id: str) -> Dict[str, Any]:
 
 
 @router.post("/runs/{run_id}/blast-radius")
-def execute_run_blast_radius(run_id: str) -> Dict[str, Any]:
+def execute_run_blast_radius(run_id: str, _auth: str = Depends(require_api_key)) -> Dict[str, Any]:
     """Execute Neo4j AST blast radius traversal for this run."""
     mgr = UnifiedDemoManager.get_instance()
     try:
@@ -122,54 +238,17 @@ def execute_run_blast_radius(run_id: str) -> Dict[str, Any]:
         raise HTTPException(status_code=500, detail=str(e))
 
 
-def get_configured_api_key() -> Optional[str]:
-    """
-    Retrieve DEMO_API_KEY from environment or .env file.
-    Always checked before any demo-run lookup or processing.
-    """
-    key = os.getenv("DEMO_API_KEY")
-    if key and key.strip():
-        return key.strip()
-    try:
-        from dotenv import load_dotenv
-        from src.config import PROJECT_ROOT
-        env_file = PROJECT_ROOT / ".env"
-        if env_file.exists():
-            load_dotenv(env_file, override=False)
-            key = os.getenv("DEMO_API_KEY")
-            if key and key.strip():
-                return key.strip()
-    except Exception:
-        pass
-    return None
-
-
 @router.post("/runs/{run_id}/logs")
 def ingest_run_log_chunk(
     run_id: str,
     req: IngestLogChunkRequest,
-    x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
-    authorization: Optional[str] = Header(default=None),
+    _auth: str = Depends(require_api_key),
 ) -> Dict[str, Any]:
     """
     Ingest a live CI log chunk.
     Automatically triggers incremental runtime prediction, Parser V2, and RCA.
-    Security: If DEMO_API_KEY environment variable is configured, verifies incoming token before run lookup.
+    Security: Validates fail-closed DEMO_API_KEY authentication via require_api_key dependency.
     """
-    configured_key = get_configured_api_key()
-    if configured_key:
-        token = x_api_key
-        if not token and authorization:
-            if authorization.lower().startswith("bearer "):
-                token = authorization[7:].strip()
-            else:
-                token = authorization.strip()
-        if not token or token != configured_key:
-            raise HTTPException(
-                status_code=401,
-                detail="Unauthorized: Invalid or missing API key for CI log ingestion.",
-            )
-
     mgr = UnifiedDemoManager.get_instance()
     try:
         return mgr.ingest_log_chunk(
@@ -186,6 +265,8 @@ def ingest_run_log_chunk(
             timestamp=req.timestamp,
             target_depth=req.depth,
             event_id=req.event_id,
+            is_milestone=req.is_milestone,
+            repo_id=req.repo_id,
         )
     except ValueError as ve:
         raise HTTPException(status_code=404, detail=str(ve))
@@ -195,7 +276,7 @@ def ingest_run_log_chunk(
 
 
 @router.post("/runs/{run_id}/replay")
-def replay_sample_log(run_id: str, req: ReplaySampleRequest) -> Dict[str, Any]:
+def replay_sample_log(run_id: str, req: ReplaySampleRequest, _auth: str = Depends(require_api_key)) -> Dict[str, Any]:
     """Replay a benchmark sample log in progressive chunks through the live pipeline."""
     mgr = UnifiedDemoManager.get_instance()
     try:
@@ -307,7 +388,7 @@ def get_warning_threshold_endpoint() -> Dict[str, Any]:
 
 @router.post("/threshold")
 @router.put("/threshold")
-def set_warning_threshold_endpoint(req: SetThresholdRequest) -> Dict[str, Any]:
+def set_warning_threshold_endpoint(req: SetThresholdRequest, _auth: str = Depends(require_api_key)) -> Dict[str, Any]:
     """Update active early-warning threshold without restarting backend."""
     from src.prediction.runtime_tracker import set_early_warning_threshold, DEFAULT_EARLY_WARNING_THRESHOLD
     try:
@@ -354,7 +435,7 @@ def get_run_rca_endpoint(run_id: str) -> Dict[str, Any]:
 
 
 @router.post("/runs/{run_id}/rca")
-def update_run_rca_endpoint(run_id: str) -> Dict[str, Any]:
+def update_run_rca_endpoint(run_id: str, _auth: str = Depends(require_api_key)) -> Dict[str, Any]:
     """Force recompute / update Root Cause Analysis for a run."""
     mgr = UnifiedDemoManager.get_instance()
     try:
@@ -440,7 +521,7 @@ def validate_scenario_endpoint(req: ValidateScenarioRequest) -> Dict[str, Any]:
 
 
 @router.post("/scenarios/dispatch")
-def dispatch_scenario_endpoint(req: DispatchScenarioRequest) -> Dict[str, Any]:
+def dispatch_scenario_endpoint(req: DispatchScenarioRequest, _auth: str = Depends(require_api_key)) -> Dict[str, Any]:
     """Initiate a demonstration scenario through GitHub Actions workflow dispatch."""
     from src.scenarios.scenario_orchestrator import ScenarioOrchestrator
     try:
@@ -483,7 +564,7 @@ def get_run_summary_endpoint(run_id: str) -> Dict[str, Any]:
 
 
 @router.post("/runs/{run_id}/summary/finalize")
-def finalize_run_summary_endpoint(run_id: str) -> Dict[str, Any]:
+def finalize_run_summary_endpoint(run_id: str, _auth: str = Depends(require_api_key)) -> Dict[str, Any]:
     """Explicitly finalize and persist run summary."""
     mgr = UnifiedDemoManager.get_instance()
     try:
@@ -493,7 +574,7 @@ def finalize_run_summary_endpoint(run_id: str) -> Dict[str, Any]:
 
 
 @router.post("/runs/{run_id}/summary/refresh")
-def refresh_run_summary_endpoint(run_id: str) -> Dict[str, Any]:
+def refresh_run_summary_endpoint(run_id: str, _auth: str = Depends(require_api_key)) -> Dict[str, Any]:
     """Recompute run summary with late-arriving logs or updated RCA."""
     mgr = UnifiedDemoManager.get_instance()
     try:

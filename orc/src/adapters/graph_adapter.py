@@ -7,6 +7,7 @@ import shutil
 import stat
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+import uuid
 
 # Add graph-doc-gen to path
 GRAPH_DOC_GEN_ROOT = Path(__file__).parent.parent.parent.parent / "graph-doc-gen-main"
@@ -58,7 +59,7 @@ gitutils_module.check_working_tree_clean = _patched_check_working_tree_clean
 from code_parser.extractor import Extractor
 from database.neo4j_client import Neo4jClient
 from maintenance.diff_agent import update_graph_from_diff
-from maintenance.git_utils import get_commit_diff
+from maintenance.git_utils import get_commit_diff, get_head_commit_sha
 
 from ..errors import GraphSyncException, InvalidCommitException
 from ..models import SuspiciousFile
@@ -277,6 +278,155 @@ class GraphAdapter:
             self.client.close()
             raise
 
+    def _perform_initial_ingestion(self, graph_working_copy: str, target_sha: str, base_sha: Optional[str] = None) -> Dict:
+        """
+        Perform genuine initial graph ingestion for a repository with no prior verified SyncState.
+        
+        Extracts AST nodes and relationships from the verified target commit source tree
+        using Tree-Sitter via Extractor, persists them into Neo4j with transaction atomicity
+        and repository isolation, establishes verified SyncState provenance, and returns
+        the synchronization result.
+        
+        Args:
+            graph_working_copy: Path to verified working copy checked out at target_sha
+            target_sha: Canonical target commit SHA
+            base_sha: Optional base commit SHA (for commit diff and changed files tracking)
+            
+        Returns:
+            Dict conforming to the synchronization result schema
+        """
+        logger.info(f"Starting initial graph ingestion for {self.repo_id}@{target_sha[:7]}")
+        
+        # 1. Verify working-tree provenance at target_sha
+        head_sha = get_head_commit_sha(graph_working_copy)
+        if head_sha != target_sha:
+            raise GraphSyncException(
+                f"Initial ingestion provenance failed: working copy HEAD ({head_sha[:7]}) "
+                f"does not match target_sha ({target_sha[:7]})"
+            )
+        
+        # 2. Extract genuine AST hierarchy and dependencies using Tree-Sitter
+        logger.info(f"Extracting AST nodes and relationships for {self.repo_id} using Tree-Sitter...")
+        extractor = Extractor(repo_id=self.repo_id)
+        extractor.parse_directory(graph_working_copy, repo_id=self.repo_id)
+        graph = extractor.get_graph()
+        nodes = graph.get("nodes", [])
+        edges = graph.get("edges", [])
+        
+        logger.info(
+            f"AST extraction complete for {self.repo_id}: {len(nodes)} nodes, {len(edges)} edges"
+        )
+        
+        # 3. Ensure schema uniqueness constraint on :SyncState(id)
+        self.client.ensure_constraints()
+        
+        # 4. Persist initial graph atomically in a single Neo4j transaction
+        files_parsed_paths = set(
+            n["properties"].get("file_path", "")
+            for n in nodes
+            if "file_path" in n.get("properties", {})
+        )
+        files_parsed_count = len(files_parsed_paths)
+        
+        with self.client.session() as session:
+            with session.begin_transaction() as tx:
+                self.client.acquire_repo_lock(self.repo_id, tx)
+                self.client.upload_graph(nodes, edges, repo_id=self.repo_id, tx=tx)
+                
+                # Record verified SyncState in Neo4j within the same transaction
+                self.client.record_sync_state(
+                    repo_id=self.repo_id,
+                    target_sha=target_sha,
+                    base_sha=None,
+                    status="SYNCED",
+                    commit_verified=True,
+                    files_parsed=files_parsed_count,
+                    files_pruned=0,
+                    nodes_count=len(nodes),
+                    edges_count=len(edges),
+                    tx=tx
+                )
+                tx.commit()
+        
+        # 5. Verify persisted Neo4j state
+        persisted_state = self._verify_persisted_state(target_sha)
+        
+        # 6. Verify node count in Neo4j
+        with self.client.session() as session:
+            res = session.run(
+                "MATCH (n {repo_id: $repo_id}) WHERE n:File OR n:Function OR n:Class OR n:Module RETURN count(n) AS cnt",
+                repo_id=self.repo_id
+            )
+            node_cnt = res.single()["cnt"]
+            if node_cnt == 0:
+                raise GraphSyncException(
+                    f"Initial ingestion verification failed: 0 AST nodes found in Neo4j for {self.repo_id}."
+                )
+            logger.info(f"✓ Verified {node_cnt} persisted AST nodes in Neo4j for {self.repo_id}")
+        
+        # Record in local SQLite sync_state manager
+        try:
+            sync_id = str(uuid.uuid4())
+            self.sync_state.verify_sync(
+                repo_id=self.repo_id,
+                target_sha=target_sha,
+                sync_id=sync_id,
+                node_count=node_cnt
+            )
+        except Exception as e:
+            logger.warning(f"Could not update local SQLite sync_state: {e}")
+        
+        # 7. Compute diff for commit-level file change reporting
+        diff = {"added": [], "modified": [], "deleted": [], "renamed": []}
+        if base_sha:
+            try:
+                diff = get_commit_diff(base_sha, target_sha, cwd=graph_working_copy)
+            except Exception as e:
+                logger.warning(f"Failed to compute diff between {base_sha[:7]} and {target_sha[:7]}: {e}")
+        
+        all_changed = (
+            diff.get("added", []) +
+            diff.get("modified", []) +
+            [new_path for old_path, new_path in diff.get("renamed", [])]
+        )
+        all_changed_abs = [
+            os.path.join(graph_working_copy, f) if not os.path.isabs(f) else f 
+            for f in all_changed
+        ]
+        
+        engine_result = {
+            "status": "SUCCESS",
+            "repo_id": self.repo_id,
+            "target_sha": target_sha,
+            "base_sha": None,
+            "commit_verified": True,
+            "files_parsed": files_parsed_count,
+            "files_pruned": 0,
+            "nodes_count": len(nodes),
+            "edges_count": len(edges),
+            "synced_at": persisted_state.get("synced_at_iso") or str(persisted_state.get("synced_at")),
+            "error": None,
+        }
+        self._validate_sync_result(engine_result, target_sha)
+        
+        logger.info(
+            f"✓ Initial graph ingestion complete: {self.repo_id}@{target_sha[:7]} "
+            f"({files_parsed_count} files parsed, {len(nodes)} nodes, {len(edges)} edges)"
+        )
+        
+        return {
+            "status": "SYNCHRONIZED",
+            "base_sha": base_sha,
+            "target_sha": target_sha,
+            "files_added": len(diff.get("added", [])),
+            "files_modified": len(diff.get("modified", [])),
+            "files_deleted": len(diff.get("deleted", [])),
+            "files_renamed": len(diff.get("renamed", [])),
+            "changed_files": all_changed_abs,
+            "engine_result": engine_result,
+            "persisted_state": persisted_state,
+        }
+
     def sync_to_sha(self, base_sha: str, target_sha: str) -> Dict:
         """
         Synchronize graph from base_sha to target_sha with verified commit provenance.
@@ -328,11 +478,11 @@ class GraphAdapter:
             # Step 3: Check existing graph state in Neo4j
             existing_sync = self.client.get_sync_state(self.repo_id)
             
-            # Step 4: Determine actual base for synchronization
+            # Step 4: Decision Flow based on SyncState
             if existing_sync is None:
-                # Initial ingestion: no prior verified state
-                logger.info(f"Initial ingestion for {self.repo_id} (no prior sync)")
-                actual_base_sha = base_sha
+                # Decision C: No prior SyncState exists -> Perform genuine initial graph ingestion
+                logger.info(f"Initial ingestion for {self.repo_id} (no prior verified SyncState in Neo4j)")
+                return self._perform_initial_ingestion(graph_working_copy, target_sha, base_sha)
             else:
                 # Incremental sync: check graph's current state
                 graph_current_sha = existing_sync.get("target_sha")
@@ -615,6 +765,24 @@ class GraphAdapter:
                     shell=True,
                 )
                 if result.returncode != 0:
+                    # Check if repo_path was mismatched and verify matching cache for self.repo_id
+                    safe_repo_id = self.repo_id.strip().replace("/", "__")
+                    repo_cache_dir = Path(__file__).resolve().parents[3] / "Metadata-Pipeline-main" / ".repo_cache" / safe_repo_id
+                    if repo_cache_dir.exists() and (repo_cache_dir / ".git").exists() and str(repo_cache_dir) != str(Path(self.repo_path).resolve()):
+                        fallback_check = subprocess.run(
+                            f'git cat-file -t "{sha}"',
+                            cwd=str(repo_cache_dir),
+                            capture_output=True,
+                            text=True,
+                            shell=True,
+                        )
+                        if fallback_check.returncode == 0:
+                            logger.info(
+                                f"Commit {sha[:7]} found in verified cache {repo_cache_dir} "
+                                f"for {self.repo_id}. Updating GraphAdapter repo_path."
+                            )
+                            self.repo_path = str(repo_cache_dir)
+                            continue
                     raise InvalidCommitException(f"Commit {sha} not found in {self.repo_id}")
         except subprocess.CalledProcessError as e:
             raise InvalidCommitException(f"Failed to validate commit: {e}") from e

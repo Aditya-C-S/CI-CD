@@ -1313,7 +1313,7 @@ def render_run_details(run: dict) -> None:
             f"<b>Backend Run ID:</b> <code>{run_id}</code>"
             f"</div>"
             f"<div style='font-size: 12px; color: #94a3b8; margin-top: 4px;'>"
-            f"<b>Branch:</b> <code>{commit_info.get('branch', 'main')}</code> &nbsp;•&nbsp; "
+            f"<b>Branch:</b> <code>{commit_info.get('branch') or run.get('branch') or 'main'}</code> &nbsp;•&nbsp; "
             f"<b>SHA:</b> <code>{str(commit_info.get('commit_sha', 'N/A'))[:7]}</code> &nbsp;•&nbsp; "
             f"<b>Source:</b> {prov.get('badge', 'UNKNOWN')} &nbsp;•&nbsp; "
             f"<b>Received Logs:</b> <b>{log_lines_count:,} lines</b>"
@@ -1381,7 +1381,7 @@ def render_run_details(run: dict) -> None:
             st.markdown(f"**Run ID:** `{run.get('run_id', 'N/A')}`")
             ci_run_id_val = ci_exec.get("ci_run_id") or "N/A (Replayed Authentic Telemetry)"
             st.markdown(f"**GitHub Actions Run ID:** `{ci_run_id_val}`")
-            st.markdown(f"**Branch:** `{commit_info.get('branch', 'main')}`")
+            st.markdown(f"**Branch:** `{commit_info.get('branch') or run.get('branch') or 'main'}`")
         
         with col2:
             status = str(run.get('status') or 'pending')

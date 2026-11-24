@@ -86,6 +86,7 @@ class MetadataAdapter:
                 "short_sha": target_sha[:7],
                 "cache_status": cache_status,
                 "features": features_dict,
+                "repo_path": str(repo_path),
             })
             return prediction_result
         
